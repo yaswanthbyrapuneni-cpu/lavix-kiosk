@@ -7,6 +7,21 @@ export interface Garment {
   category: string;
   imageUrl: string;
   price?: number;
+  /** URL of a .glb/.gltf model for the 3D Mannequin viewer — the highest
+   * quality option when one exists. Optional; most garments won't have one,
+   * which is an expected, handled state, not an error (see
+   * components/ThreeDMannequin/ModelError.tsx). */
+  model3dUrl?: string;
+  /** Optional second admin-uploaded photo (back view). Powers the photo-
+   * billboard 3D preview fallback when there's no model3dUrl. */
+  backImageUrl?: string;
+  /** Background-removed cutout of imageUrl, auto-generated server-side
+   * (rembg) at upload time — used to texture the front billboard in the 3D
+   * Mannequin viewer's photo-preview mode. Not the same image as imageUrl,
+   * which still shows the full catalogue photo (model, background, etc). */
+  frontCutoutUrl?: string;
+  /** Same, derived from backImageUrl. Only present when backImageUrl is. */
+  backCutoutUrl?: string;
 }
 
 export function isWomensGarment(category: string = "", name: string = ""): boolean {
@@ -108,11 +123,17 @@ export async function getGarments(force = false): Promise<Garment[]> {
       const res = await fetch(`${API_BASE_URL}/garments`, { method: "GET" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: Garment[] = await res.json();
+      // The local-fallback upload path can return a relative /static/...
+      // path for any of these; Supabase-hosted ones are already absolute.
+      const absolutize = (url: string | undefined) =>
+        url && url.startsWith("/") ? `${API_BASE_URL}${url}` : url;
       const mapped = data.map((item) => ({
         ...item,
-        imageUrl: item.imageUrl && item.imageUrl.startsWith("/")
-          ? `${API_BASE_URL}${item.imageUrl}`
-          : item.imageUrl
+        imageUrl: absolutize(item.imageUrl) as string,
+        model3dUrl: absolutize(item.model3dUrl),
+        backImageUrl: absolutize(item.backImageUrl),
+        frontCutoutUrl: absolutize(item.frontCutoutUrl),
+        backCutoutUrl: absolutize(item.backCutoutUrl)
       }));
       garmentsCache = { data: mapped, at: Date.now() };
       return mapped;
@@ -139,6 +160,13 @@ export async function uploadGarment(data: {
   gender: string;
   image: string; // base64 string
   price?: number;
+  /** Optional URL to a hosted .glb/.gltf — not a file upload; the admin
+   * pastes a link to an already-hosted model. See AdminPage's upload form. */
+  model3dUrl?: string;
+  /** Optional second photo (back view), base64 — same shape as `image`. The
+   * backend auto-generates a background-removed cutout of both this and
+   * `image` for the 3D Mannequin viewer's photo-preview mode. */
+  backImage?: string;
 }): Promise<GarmentUploadResponse> {
   try {
     const res = await fetch(`${API_BASE_URL}/garments`, {

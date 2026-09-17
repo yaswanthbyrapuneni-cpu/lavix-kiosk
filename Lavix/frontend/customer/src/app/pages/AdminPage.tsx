@@ -28,6 +28,7 @@ import {
   AlertCircle,
   Eye,
   EyeOff,
+  Box,
   Menu,
   X
 } from "lucide-react";
@@ -735,6 +736,41 @@ function AnalyticsView() {
         </div>
       </div>
 
+      {/* AI Render Reliability — how try-on requests are actually resolving:
+          a real fitted Vertex render, the flat local-compositor fallback, or
+          a hard failure. Surfaces problems as a trend instead of only via a
+          shop owner's screenshot. */}
+      {(() => {
+        const reliability = feedbackAnalytics?.tryon_reliability || { vertex: 0, local: 0, failed: 0, total: 0, vertex_success_rate: 0 };
+        if (reliability.total === 0) return null;
+        return (
+          <div className="bg-white p-6 rounded-2xl border border-gray-200 shadow-sm flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-bold text-gray-900 text-base">AI Render Reliability</h3>
+              <span className="text-xs text-gray-400 font-medium">Last {reliability.total} try-ons</span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-3xl font-bold text-emerald-600">{reliability.vertex_success_rate}%</span>
+                <span className="text-xs text-gray-500 font-medium">Real AI-fitted renders</span>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-xl font-bold text-gray-900">{reliability.vertex}</span>
+                <span className="text-xs text-gray-500 font-medium">Vertex AI</span>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-xl font-bold text-amber-600">{reliability.local}</span>
+                <span className="text-xs text-gray-500 font-medium">Fallback preview</span>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="text-xl font-bold text-red-600">{reliability.failed}</span>
+                <span className="text-xs text-gray-500 font-medium">Failed</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Charts Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-gray-200 shadow-sm flex flex-col gap-4">
@@ -966,6 +1002,13 @@ function UploadGarmentsView() {
   const [gender, setGender] = useState<"Men" | "Women">("Men");
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [price, setPrice] = useState("3999");
+  // A URL, not a file upload — staff paste a link to an already-hosted
+  // .glb/.gltf. Optional; most garments won't have one yet.
+  const [model3dUrl, setModel3dUrl] = useState("");
+  // Optional second photo (back view). Mirrors imagePreview exactly. When no
+  // real model3dUrl exists, the backend derives a 3D-preview billboard pair
+  // from this and the main image automatically.
+  const [backImagePreview, setBackImagePreview] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const [garmentsList, setGarmentsList] = useState<Garment[]>([]);
@@ -1092,6 +1135,15 @@ function UploadGarmentsView() {
     setImagePreview(processedFiles[0].preview); // fallback only, bulk mode doesn't render this
   };
 
+  const handleBackImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => setBackImagePreview(reader.result as string);
+      reader.readAsDataURL(file);
+    }
+  };
+
   const handleDelete = async (id: string | number, garmentName: string) => {
     const targetId = String(id);
     setGarmentsList((prev) => prev.filter((g) => String(g.id) !== targetId));
@@ -1150,7 +1202,9 @@ function UploadGarmentsView() {
       category,
       gender,
       image: imagePreview,
-      price: price ? Number(price) : 3999
+      price: price ? Number(price) : 3999,
+      model3dUrl: model3dUrl.trim() || undefined,
+      backImage: backImagePreview || undefined
     });
 
     if (res.success) {
@@ -1159,6 +1213,8 @@ function UploadGarmentsView() {
       setColor("");
       setPrice("3999");
       setImagePreview(null);
+      setModel3dUrl("");
+      setBackImagePreview(null);
       fetchCatalog();
     } else {
       setMessage({ text: res.error || "Upload failed", type: "error" });
@@ -1355,6 +1411,51 @@ function UploadGarmentsView() {
               )}
             </div>
 
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-semibold text-gray-700">
+                Back View Photo <span className="font-normal text-gray-400">(optional — improves the "3D Mannequin" preview)</span>
+              </label>
+              <div className="border-2 border-dashed border-gray-300 rounded-2xl p-6 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer relative">
+                {backImagePreview ? (
+                  <div className="flex flex-col items-center gap-3">
+                    <img src={backImagePreview} alt="Back view preview" className="h-44 object-contain rounded-lg border shadow-sm bg-white" />
+                    <span className="text-xs text-gray-500 font-medium">Click to replace photo</span>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center gap-2">
+                    <Upload className="w-9 h-9 text-gray-400" />
+                    <span className="text-sm font-semibold text-gray-700">Select Back View Photo</span>
+                    <span className="text-xs text-gray-400">Same garment, photographed from behind</span>
+                  </div>
+                )}
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={handleBackImageChange}
+                  className="absolute inset-0 opacity-0 cursor-pointer"
+                />
+              </div>
+              <span className="text-xs text-gray-400">
+                Without this, "3D Mannequin" still works using just the front photo above — the back simply won't be shown while rotating.
+              </span>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-semibold text-gray-700">
+                3D Model URL <span className="font-normal text-gray-400">(optional — best-quality "3D Mannequin", if you have one)</span>
+              </label>
+              <input
+                type="url"
+                placeholder="https://.../garment.glb"
+                value={model3dUrl}
+                onChange={(e) => setModel3dUrl(e.target.value)}
+                className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
+              />
+              <span className="text-xs text-gray-400">
+                Link to an already-hosted .glb/.gltf file. When set, this is used instead of the front/back photos above. Leave blank if none exists yet.
+              </span>
+            </div>
+
             <button
               type="submit"
               disabled={uploading}
@@ -1428,6 +1529,31 @@ function UploadGarmentsView() {
                     <span className="font-semibold text-gray-900 text-xs truncate">{garment.name}</span>
                     <span className="text-[11px] text-indigo-600 font-medium capitalize">{garment.category} • {garment.color}</span>
                   </div>
+                  {garment.model3dUrl ? (
+                    <span
+                      title="Has a real 3D model — best quality"
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-50 text-violet-600 text-[10px] font-bold shrink-0"
+                    >
+                      <Box className="w-3 h-3" />
+                      3D
+                    </span>
+                  ) : garment.frontCutoutUrl && garment.backCutoutUrl ? (
+                    <span
+                      title="3D Mannequin preview: front + back photos"
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-50 text-violet-600 text-[10px] font-bold shrink-0"
+                    >
+                      <Box className="w-3 h-3" />
+                      360°
+                    </span>
+                  ) : garment.frontCutoutUrl ? (
+                    <span
+                      title="3D Mannequin preview: front photo only, no back view uploaded"
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-50 text-amber-600 text-[10px] font-bold shrink-0"
+                    >
+                      <Box className="w-3 h-3" />
+                      Front
+                    </span>
+                  ) : null}
                   <button
                     onClick={() => handleDelete(garment.id, garment.name)}
                     className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition-colors shrink-0"

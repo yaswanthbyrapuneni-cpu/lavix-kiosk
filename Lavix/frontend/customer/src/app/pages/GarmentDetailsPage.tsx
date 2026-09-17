@@ -76,6 +76,9 @@ export function GarmentDetailsPage() {
       relatedProducts={[
         { id: 1, name: garmentName, image: garmentImage },
       ]}
+      model3dUrl={garment?.model3dUrl}
+      frontCutoutUrl={garment?.frontCutoutUrl}
+      backCutoutUrl={garment?.backCutoutUrl}
     />
   );
 }
