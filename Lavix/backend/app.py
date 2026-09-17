@@ -539,7 +539,7 @@ def get_garments():
     
     if _supabase_connected:
         try:
-            url = f"{SUPABASE_URL}/rest/v1/garments?select=*"
+            url = f"{SUPABASE_URL}/rest/v1/garments?select=*&order=created_at.desc"
             response = requests.get(url, headers=get_supabase_headers(), timeout=10)
             if response.status_code == 200:
                 data = response.json()
@@ -556,7 +556,10 @@ def get_garments():
             logger.error(f"Error fetching from Supabase: {e}")
 
     # Combine fallback, local persistent garments, and supabase garments
-    all_garments = FALLBACK_GARMENTS + local_garments + supabase_garments
+    # Newest first: supabase garments already come back ordered by created_at
+    # desc; local/fallback lists are stored oldest-appended-last, so reverse
+    # them to match instead of always trailing behind real catalogue entries.
+    all_garments = supabase_garments + local_garments[::-1] + FALLBACK_GARMENTS[::-1]
     
     # Deduplicate by ID, Name, and Image URL while preserving order, excluding deleted items
     seen_keys = set()
