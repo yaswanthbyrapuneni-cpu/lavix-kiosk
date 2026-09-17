@@ -1,12 +1,12 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, lazy, Suspense } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { 
-  ChevronRight, 
-  ArrowRight, 
-  ScanFace, 
-  X, 
-  Upload, 
-  Camera as CameraIcon, 
+import {
+  ChevronRight,
+  ArrowRight,
+  ScanFace,
+  X,
+  Upload,
+  Camera as CameraIcon,
   AlertCircle,
   Heart,
   ZoomIn,
@@ -20,6 +20,7 @@ import {
   Search,
   Sparkles,
   ShoppingBag,
+  Box,
   SwitchCamera
 } from "lucide-react";
 import Webcam from "react-webcam";
@@ -29,6 +30,25 @@ import { convertUrlToBase64, requestVirtualTryOn, PRODUCT_CATEGORIES } from "../
 import { useTryOnActivity } from "../context/TryOnActivityContext";
 import { loadDetector, runDetection } from "../detectors/DetectorManager";
 import { evaluateFraming, FramingHint } from "../utils/framing";
+
+// three.js + @react-three/fiber + @react-three/drei are a large chunk with no
+// place in every product page's initial bundle — only fetched once a customer
+// actually clicks "3D Mannequin". Deliberately not importing anything from
+// components/ThreeDMannequin/* other than this dynamic import — even a single
+// static import from that folder into this eagerly-loaded page would pull the
+// whole 3D stack back into the main bundle and defeat the split entirely.
+const MannequinModal = lazy(() => import("../components/ThreeDMannequin"));
+
+/** Shown only while the lazy chunk above is still downloading — deliberately
+ * has zero dependency on three/fiber/drei so it's safe to import eagerly. */
+function MannequinChunkLoading() {
+  return (
+    <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center gap-4">
+      <div className="w-14 h-14 rounded-full border-4 border-white/20 border-t-emerald-400 animate-spin" />
+      <p className="text-white text-base font-semibold tracking-wide">Loading 3D Preview…</p>
+    </div>
+  );
+}
 
 export interface ColorOption {
   name: string;
@@ -49,6 +69,20 @@ function getColorHex(name: string): string {
   if (lower.includes("purple") || lower.includes("wine") || lower.includes("burgundy")) return "#581845";
   if (lower.includes("silver") || lower.includes("grey") || lower.includes("gray")) return "#8e9aaf";
   return "#4d4d4d";
+}
+
+/**
+ * Whether this garment only needs the customer's upper body in frame (worn
+ * above the waist) versus needing more of the body visible for the render
+ * to make sense. Checked against category + product name together since
+ * the static demo pages (MensProductDetails/WomensProductDetails) pass a
+ * generic category like "Men Collection", not the actual garment type --
+ * the real signal there is in the product name instead.
+ */
+function isUpperBodyGarment(category: string, productName: string): boolean {
+  const text = `${category} ${productName}`.toLowerCase();
+  if (/\b(t-?shirt|tee|jacket|blazer|coat|shirt|top|blouse)\b/.test(text)) return true;
+  return false;
 }
 
 const EXTENDED_CATEGORIES = [
@@ -84,6 +118,16 @@ interface ProductDetailsPageProps {
     name: string;
     image: string;
   }[];
+  /** Absent for garments with no 3D asset yet, and for the static demo pages
+   * (Mens/WomensProductDetails) which have no real Garment record to draw one
+   * from. The "3D Mannequin" button still renders either way — the viewer
+   * itself shows a "not available" message rather than the button vanishing. */
+  model3dUrl?: string;
+  /** Server-generated (rembg) cutout of the garment's main photo — the 3D
+   * Mannequin viewer's fallback when model3dUrl is absent. */
+  frontCutoutUrl?: string;
+  /** Cutout of the admin's optional back-view photo. */
+  backCutoutUrl?: string;
 }
 
 export function ProductDetailsPage({
@@ -99,7 +143,15 @@ export function ProductDetailsPage({
   colors,
   sizes,
   relatedProducts,
+  model3dUrl,
+  frontCutoutUrl,
+  backCutoutUrl,
 }: ProductDetailsPageProps) {
+  // Shirts/jackets/tops only need waist-up in frame; sarees/dresses/jeans
+  // need more of the body visible. Used to relax how close the customer is
+  // allowed to stand for the framing guidance below.
+  const bodyCoverage = isUpperBodyGarment(category, productName) ? "upper" : "full";
+
   const colorOptions: ColorOption[] = (colors || []).map((c, i) => {
     if (typeof c === "object" && c.name && c.hex) return c;
     if (typeof c === "string" && (c.startsWith("#") || c.startsWith("rgb"))) {
@@ -142,6 +194,10 @@ export function ProductDetailsPage({
       return () => clearInterval(interval);
     }
   }, [isTryOnLoading]);
+
+  // Independent of the try-on state above — this is a separate feature with
+  // its own modal, not a mode of the try-on mirror.
+  const [isMannequinModalOpen, setIsMannequinModalOpen] = useState(false);
 
   // Virtual Try-On Panel State
   const [zoomLevel, setZoomLevel] = useState<number>(100);
@@ -195,7 +251,7 @@ export function ProductDetailsPage({
           if (video && video.readyState >= 2) {
             try {
               const result = runDetection("face", video) as any;
-              setFramingHint(evaluateFraming(result?.faceLandmarks?.[0]));
+              setFramingHint(evaluateFraming(result?.faceLandmarks?.[0], bodyCoverage));
             } catch {
               // A transient detector hiccup shouldn't crash the mirror; try
               // again next frame.
@@ -211,7 +267,7 @@ export function ProductDetailsPage({
       cancelled = true;
       cancelAnimationFrame(framingRafRef.current);
     };
-  }, [isTryOnModalOpen, isCameraActive, faceImage, modalCameraCountdown]);
+  }, [isTryOnModalOpen, isCameraActive, faceImage, modalCameraCountdown, bodyCoverage]);
 
   // Customer Feedback States
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
@@ -292,11 +348,21 @@ export function ProductDetailsPage({
     }
   }, [modalCameraCountdown]);
 
-  const handleStartModalCountdown = () => {
-    if (modalCameraCountdown === null) {
-      setModalCameraCountdown(3);
-    }
-  };
+  // Fully automatic capture: no button to press at all. As soon as framing
+  // is confirmed good, start the countdown on its own after a brief
+  // stability window. The window matters because a face detector's reading
+  // can flicker frame-to-frame (evaluateFraming returns a new object every
+  // tick even when nothing has changed) -- depending on framingHint.ready
+  // specifically, rather than the framingHint object itself, means this
+  // effect only restarts when "ready" actually flips, not 60 times a
+  // second, so the timer isn't perpetually reset back to zero.
+  const isFramingReady = framingHint?.ready ?? false;
+  const AUTO_CAPTURE_STABLE_MS = 800;
+  useEffect(() => {
+    if (!isFramingReady || modalCameraCountdown !== null || faceImage) return;
+    const timer = setTimeout(() => setModalCameraCountdown(3), AUTO_CAPTURE_STABLE_MS);
+    return () => clearTimeout(timer);
+  }, [isFramingReady, modalCameraCountdown, faceImage]);
 
   const handleUploadClick = () => {
     if (fileInputRef.current) {
@@ -485,18 +551,29 @@ export function ProductDetailsPage({
               </div>
 
               {/* Action Buttons */}
-              <div className="flex flex-col sm:flex-row gap-3 sm:gap-[16px] mt-2 sm:mt-[16px]">
-                <button 
-                  onClick={handleOpenMirrorModal}
-                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
-                >
-                  <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300" />
-                  <span>Virtual Try-On Mirror</span>
-                </button>
+              <div className="flex flex-col gap-3 sm:gap-[16px] mt-2 sm:mt-[16px]">
+                <div className="flex flex-col sm:flex-row gap-3 sm:gap-[16px]">
+                  <button
+                    onClick={handleOpenMirrorModal}
+                    className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
+                  >
+                    <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300" />
+                    <span>Virtual Try-On Mirror</span>
+                  </button>
 
-                <button 
+                  <button
+                    onClick={() => setIsMannequinModalOpen(true)}
+                    aria-label="3D Mannequin"
+                    className="flex-1 bg-violet-600 hover:bg-violet-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
+                  >
+                    <Box className="w-5 h-5 sm:w-6 sm:h-6 text-violet-200" />
+                    <span>3D Mannequin</span>
+                  </button>
+                </div>
+
+                <button
                   onClick={() => setCartAdded(true)}
-                  className={`flex-1 font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-sm ${
+                  className={`font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-sm ${
                     cartAdded ? "bg-emerald-600 text-white" : "bg-black hover:bg-gray-900 text-white"
                   }`}
                 >
@@ -714,23 +791,17 @@ export function ProductDetailsPage({
                     </div>
                   )}
 
-                  {/* Bottom Center Floating Action Control Bar */}
+                  {/* Bottom Center Floating Action Control Bar — capture itself is
+                      fully automatic (see the framing-driven effect above), so
+                      the only manual action left here is the upload alternative. */}
                   <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-4 bg-black/60 backdrop-blur-xl p-3 px-6 rounded-full border border-white/20 shadow-2xl">
-                    <button 
-                      onClick={handleStartModalCountdown}
-                      disabled={modalCameraCountdown !== null}
-                      className="px-8 py-3.5 bg-gradient-to-r from-emerald-400 to-teal-500 hover:from-emerald-500 hover:to-teal-600 text-black font-extrabold text-lg rounded-full shadow-2xl transition-all active:scale-95 disabled:opacity-50 cursor-pointer flex items-center gap-2"
-                    >
-                      <Sparkles className="w-5 h-5 text-black fill-black" />
-                      <span>{modalCameraCountdown !== null ? `${modalCameraCountdown}s` : "Start Virtual Try-On"}</span>
-                    </button>
-
                     <button
                       onClick={handleUploadClick}
-                      className="p-3.5 bg-white/10 hover:bg-white/20 text-white rounded-full border border-white/20 backdrop-blur-md shadow-2xl transition-transform active:scale-95 cursor-pointer"
+                      className="px-5 py-3 bg-white/10 hover:bg-white/20 text-white rounded-full border border-white/20 backdrop-blur-md shadow-2xl transition-transform active:scale-95 cursor-pointer flex items-center gap-2 text-sm font-semibold"
                       title="Upload Photo from Device"
                     >
-                      <Upload size={20} />
+                      <Upload size={18} />
+                      <span>Upload Photo Instead</span>
                     </button>
                   </div>
                 </div>
@@ -746,6 +817,20 @@ export function ProductDetailsPage({
         selectedGarment={productName}
       />
         </div>
+      )}
+
+      {/* 3D MANNEQUIN VIEWER — independent of the try-on mirror above; its own
+          modal, own state, own lazy-loaded code chunk. */}
+      {isMannequinModalOpen && (
+        <Suspense fallback={<MannequinChunkLoading />}>
+          <MannequinModal
+            garmentName={productName}
+            model3dUrl={model3dUrl}
+            frontPhotoUrl={frontCutoutUrl}
+            backPhotoUrl={backCutoutUrl}
+            onClose={() => setIsMannequinModalOpen(false)}
+          />
+        </Suspense>
       )}
 
     </div>

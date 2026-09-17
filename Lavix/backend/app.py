@@ -39,6 +39,12 @@ VERTEX_REGION = os.getenv('VERTEX_REGION', 'us-central1')
 # nginx proxy_read_timeout (180s). Equal values race: the worker gets killed
 # while encoding a response Vertex had already returned successfully.
 VERTEX_TIMEOUT = int(os.getenv('VERTEX_TIMEOUT', '90'))
+# Split VERTEX_TIMEOUT across up to two attempts rather than adding a second
+# full timeout on top -- a lot of Vertex failures are transient (a momentary
+# error response, a one-off flaky call) and succeed on retry, but the total
+# time spent must stay within the same budget the rest of the pipeline
+# already assumes VERTEX_TIMEOUT represents.
+VERTEX_ATTEMPT_TIMEOUT = max(20, VERTEX_TIMEOUT // 2)
 
 _vertex_credentials = None
 # Workers are threaded (see gunicorn.conf.py), so concurrent try-ons would
@@ -97,6 +103,123 @@ def get_rembg_session():
     return _rembg_session or None
 
 
+def _rembg_remove_background(g_img: "Image.Image") -> "Image.Image":
+    """
+    Shared rembg background-removal step, with the same luminance-threshold
+    fallback used everywhere else in this file when rembg itself is
+    unavailable. Extracted so isolate_garment_image (fixed-percentage crop,
+    used by the 3D Mannequin cutouts) and the adaptive face-detection-gated
+    crop (used for the Vertex try-on reference photo) share one
+    implementation instead of two copies drifting apart.
+    """
+    g_img = g_img.convert("RGBA")
+    g_img_clean = g_img
+    try:
+        session = get_rembg_session()
+        if session is None:
+            raise RuntimeError("rembg session unavailable")
+        import rembg
+        g_img_clean = rembg.remove(g_img, session=session)
+    except Exception as re_err:
+        logger.warning(f"Could not use rembg for background removal, falling back: {re_err}")
+        g_np = np.array(g_img)
+        if g_np.shape[2] == 4:
+            r, g_c, b, a = g_np[:, :, 0], g_np[:, :, 1], g_np[:, :, 2], g_np[:, :, 3]
+            is_light = (r > 215) & (g_c > 215) & (b > 215)
+            g_np[is_light, 3] = 0
+            g_img_clean = Image.fromarray(g_np)
+    return g_img_clean
+
+
+def isolate_garment_image(g_img: "Image.Image") -> "Image.Image":
+    """
+    Cuts a garment out of a photo of it being worn -- rembg background removal,
+    then an aggressive crop to strip the model's head/face, the ground, and
+    side clutter, leaving just the garment on a transparent background.
+
+    Extracted from process_local_tryon (which still uses it, unchanged) so the
+    3D Mannequin photo-billboard feature can produce the exact same clean
+    cutout from the admin's front/back garment photos, rather than
+    reimplementing this.
+    """
+    g_img_clean = _rembg_remove_background(g_img)
+
+    # Top 33% (model head/face), bottom 15% (ground/watermarks), left/right
+    # 28% each (side models, walls, background clutter).
+    g_w, g_h = g_img_clean.size
+    if g_h > 100:
+        g_img_clean = g_img_clean.crop((int(g_w * 0.28), int(g_h * 0.33), int(g_w * 0.72), int(g_h * 0.85)))
+
+    return g_img_clean
+
+
+def _crop_face_region_if_present(g_img: "Image.Image") -> "Image.Image":
+    """
+    Crops away a model's head/face from a garment reference photo, but only
+    when a face is actually detected there -- unlike isolate_garment_image's
+    fixed-percentage crop (tuned for the 3D Mannequin cutouts, which assumes
+    every photo is a generously-margined full-body shot). Tested against
+    real catalog photos: a large share of admin uploads are already tight
+    torso-only crops with no face in frame at all, and blindly cropping the
+    top third of those butchers the garment itself, leaving nothing but a
+    texture swatch with no visible collar/pocket/silhouette. Detecting the
+    face first and cropping just past its chin -- or not cropping at all
+    when there's no face to remove -- handles both photo styles correctly.
+    """
+    try:
+        import cv2
+        rgb = np.array(g_img.convert("RGB"))
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        detector = cv2.CascadeClassifier(cascade_path)
+        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        if len(faces) == 0:
+            return g_img
+
+        # Largest detected face -- crop everything from just past its chin
+        # downward, leaving the garment below completely untouched.
+        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        g_w, g_h = g_img.size
+        crop_top = int(fy + fh * 1.3)
+        crop_top = max(0, min(crop_top, int(g_h * 0.6)))  # never eat more than 60% of the frame
+        if crop_top <= 0:
+            return g_img
+        return g_img.crop((0, crop_top, g_w, g_h))
+    except Exception as e:
+        logger.warning(f"Face detection for garment isolation failed, skipping crop: {e}")
+        return g_img
+
+
+def isolate_garment_b64_for_vertex(garment_b64: str) -> str:
+    """
+    Prepares the garment reference photo for Vertex: rembg background
+    removal, plus a face-detection-gated crop (see _crop_face_region_if_present)
+    instead of the 3D Mannequin cutout's fixed-percentage crop. Garment
+    catalog photos routinely show a model wearing the item with their face
+    fully visible; Vertex's virtual-try-on model has been observed leaking
+    that face into the output as a floating artifact when given an
+    uncropped reference photo -- but real admin uploads vary hugely in
+    framing, and many are already tight torso-only crops with no face at
+    all, which a blind fixed-percentage crop would butcher. Falls back to
+    the original image, only color-normalized, if isolation fails for any
+    reason -- a messier reference is still better than no result at all.
+    """
+    try:
+        img_bytes = base64.b64decode(garment_b64)
+        img = Image.open(io.BytesIO(img_bytes))
+        isolated = _crop_face_region_if_present(_rembg_remove_background(img))
+        # Vertex expects a normal product photo, not a transparent cutout --
+        # flatten onto white, matching convert_to_clean_rgb_b64's convention.
+        background = Image.new("RGB", isolated.size, (255, 255, 255))
+        background.paste(isolated, mask=isolated.split()[-1])
+        buffered = io.BytesIO()
+        background.save(buffered, format="JPEG", quality=95)
+        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+    except Exception as e:
+        logger.warning(f"Garment isolation for Vertex failed, using original image instead: {e}")
+        return convert_to_clean_rgb_b64(garment_b64)
+
+
 def process_local_tryon(person_b64: str, garments_b64: list) -> str:
     """
     High quality local Virtual Try-On compositor using PIL & NumPy.
@@ -112,7 +235,7 @@ def process_local_tryon(person_b64: str, garments_b64: list) -> str:
         person_bytes = base64.b64decode(person_b64_clean)
         person_img = Image.open(io.BytesIO(person_bytes)).convert("RGBA")
         p_width, p_height = person_img.size
-        
+
         current_img = person_img.copy()
 
         for g_index, g_b64 in enumerate(garments_b64):
@@ -125,32 +248,9 @@ def process_local_tryon(person_b64: str, garments_b64: list) -> str:
                 # the person image and any other garments are still usable.
                 logger.warning(f"Skipping unreadable garment {g_index}: {g_err}")
                 continue
-            
-            # Remove background using rembg if available, otherwise fallback
-            g_img_clean = g_img
-            try:
-                session = get_rembg_session()
-                if session is None:
-                    raise RuntimeError("rembg session unavailable")
-                import rembg
-                g_img_clean = rembg.remove(g_img, session=session)
-            except Exception as re_err:
-                logger.warning(f"Could not use rembg for background removal, falling back: {re_err}")
-                g_np = np.array(g_img)
-                if g_np.shape[2] == 4:
-                    r, g_c, b, a = g_np[:,:,0], g_np[:,:,1], g_np[:,:,2], g_np[:,:,3]
-                    is_light = (r > 215) & (g_c > 215) & (b > 215)
-                    g_np[is_light, 3] = 0
-                    g_img_clean = Image.fromarray(g_np)
 
-            # Crop the garment image more aggressively:
-            # - Top 33% (removes model head/face)
-            # - Bottom 15% (removes pants, grass, ground, and bottom-left white boxes/watermarks)
-            # - Left 28% and Right 28% (removes side models/people, walls, and side background clutter)
+            g_img_clean = isolate_garment_image(g_img)
             g_w, g_h = g_img_clean.size
-            if g_h > 100:
-                g_img_clean = g_img_clean.crop((int(g_w * 0.28), int(g_h * 0.33), int(g_w * 0.72), int(g_h * 0.85)))
-                g_w, g_h = g_img_clean.size
 
             if g_w <= 0 or g_h <= 0:
                 continue
@@ -217,6 +317,66 @@ def health():
     return jsonify({'status': 'ok', 'service': 'lavix-backend'}), 200
 
 
+def _track_tryon_event(mode: str, garment_count: int, error_reason: str = None):
+    """
+    Records how a /try-on call actually resolved (real Vertex render, flat
+    local-compositor fallback, or hard failure) so the admin dashboard can
+    show real reliability numbers instead of relying on someone noticing and
+    reporting a bad render. Fire-and-forget on a background thread -- must
+    never add latency to, or be able to fail, the customer-facing response.
+    Silently no-ops if Supabase isn't connected or the table doesn't exist
+    yet (it isn't auto-migrated; see schema.sql).
+    """
+    if not _supabase_connected:
+        return
+
+    def _send():
+        try:
+            requests.post(
+                f"{SUPABASE_URL}/rest/v1/tryon_events",
+                headers=get_supabase_headers(),
+                json={
+                    'mode': mode,
+                    'garment_count': garment_count,
+                    'error_reason': (error_reason or None) and str(error_reason)[:500],
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record tryon_event ({mode}): {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _get_tryon_reliability_summary(limit: int = 500) -> dict:
+    """
+    Reads back the most recent tryon_events rows and summarizes them into
+    counts per mode plus a Vertex success rate. Returns all zeros (not an
+    error) if Supabase is unreachable or the table doesn't exist yet, so a
+    dashboard reading this never has to special-case "no data yet".
+    """
+    empty = {'vertex': 0, 'local': 0, 'failed': 0, 'total': 0, 'vertex_success_rate': 0.0}
+    if not _supabase_connected:
+        return empty
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/tryon_events?select=mode&order=id.desc&limit={limit}"
+        resp = requests.get(url, headers=get_supabase_headers(), timeout=10)
+        if resp.status_code != 200:
+            return empty
+        rows = resp.json()
+        counts = {'vertex': 0, 'local': 0, 'failed': 0}
+        for row in rows:
+            m = row.get('mode')
+            if m in counts:
+                counts[m] += 1
+        total = len(rows)
+        rate = round((counts['vertex'] / total * 100), 1) if total > 0 else 0.0
+        return {**counts, 'total': total, 'vertex_success_rate': rate}
+    except Exception as e:
+        logger.warning(f"Failed to read tryon_events for reliability summary: {e}")
+        return empty
+
+
 def _local_tryon_response(person_b64, garments_b64, reason):
     """
     Fallback path when Vertex is unavailable. If the compositor also fails there
@@ -227,12 +387,14 @@ def _local_tryon_response(person_b64, garments_b64, reason):
         res_b64 = process_local_tryon(person_b64, garments_b64)
     except Exception as local_err:
         logger.error(f"Local compositor also failed after Vertex fallback: {local_err}")
+        _track_tryon_event('failed', len(garments_b64), f"{reason}; {local_err}")
         return jsonify({
             'success': False,
             'error': 'Could not generate the try-on. Please retake the photo and try again.',
             'fallback_reason': reason,
         }), 502
 
+    _track_tryon_event('local', len(garments_b64), reason)
     return jsonify({
         'success': True,
         'result_image': f"data:image/jpeg;base64,{res_b64}",
@@ -300,7 +462,7 @@ def try_on():
             mime_type = 'image/png'
 
             for i, garment_b64 in enumerate(garments_b64):
-                garment_rgb = convert_to_clean_rgb_b64(garment_b64)
+                garment_rgb = isolate_garment_b64_for_vertex(garment_b64)
                 payload = {
                     "instances": [{
                         "personImage": {
@@ -317,35 +479,54 @@ def try_on():
                     "parameters": {"sampleCount": 1, "personGeneration": "allow_all"}
                 }
 
-                # virtual-try-on-001 routinely takes 15-40s. A short timeout here
-                # silently demotes good requests to the flat local compositor,
-                # which is what produces "the garment is just pasted on" results.
-                response = requests.post(url, json=payload, headers=headers, timeout=VERTEX_TIMEOUT)
+                # Up to two attempts within VERTEX_TIMEOUT's existing budget (see
+                # VERTEX_ATTEMPT_TIMEOUT) -- a lot of Vertex failures are transient
+                # (a momentary error, a one-off flaky call) and succeed on retry,
+                # which is a lot better for the customer than instantly falling
+                # back to the flat local compositor on the first hiccup.
+                garment_result_b64 = None
+                last_attempt_err = None
+                for attempt in range(2):
+                    try:
+                        response = requests.post(url, json=payload, headers=headers, timeout=VERTEX_ATTEMPT_TIMEOUT)
 
-                if not response.ok:
-                    # raise_for_status() throws away the response body, and the body
-                    # is where Vertex explains what actually went wrong.
-                    raise RuntimeError(
-                        f"Vertex returned {response.status_code}: {response.text[:500]}"
-                    )
+                        if not response.ok:
+                            # raise_for_status() throws away the response body, and the
+                            # body is where Vertex explains what actually went wrong.
+                            raise RuntimeError(
+                                f"Vertex returned {response.status_code}: {response.text[:500]}"
+                            )
 
-                result = response.json()
-                predictions = result.get('predictions', [])
-                if not predictions:
-                    raise RuntimeError(f"Vertex returned no predictions: {str(result)[:500]}")
+                        result = response.json()
+                        predictions = result.get('predictions', [])
+                        if not predictions:
+                            raise RuntimeError(f"Vertex returned no predictions: {str(result)[:500]}")
 
-                pred = predictions[0]
-                result_b64 = (
-                    pred.get('bytesBase64Encoded') or
-                    pred.get('image', {}).get('bytesBase64Encoded', '')
-                )
-                if not result_b64:
-                    raise RuntimeError(f"Vertex prediction had no image bytes: {str(pred)[:500]}")
+                        pred = predictions[0]
+                        candidate_b64 = (
+                            pred.get('bytesBase64Encoded') or
+                            pred.get('image', {}).get('bytesBase64Encoded', '')
+                        )
+                        if not candidate_b64:
+                            raise RuntimeError(f"Vertex prediction had no image bytes: {str(pred)[:500]}")
 
-                current_person_b64 = result_b64
+                        garment_result_b64 = candidate_b64
+                        break
+                    except Exception as attempt_err:
+                        last_attempt_err = attempt_err
+                        if attempt == 0:
+                            logger.warning(
+                                f"Vertex attempt 1/2 failed for garment {i + 1}, retrying once: {attempt_err}"
+                            )
+
+                if garment_result_b64 is None:
+                    raise last_attempt_err
+
+                current_person_b64 = garment_result_b64
                 logger.info(f"Garment {i + 1}/{len(garments_b64)} rendered via Vertex AI")
 
             logger.info("Try-on sequence generated via Vertex AI")
+            _track_tryon_event('vertex', len(garments_b64))
             return jsonify({
                 'success': True,
                 'result_image': f"data:image/png;base64,{current_person_b64}",
@@ -370,6 +551,7 @@ def try_on():
 
     except Exception as e:
         logger.error(f"Try-on error: {e}")
+        _track_tryon_event('failed', len(locals().get('garments_b64', []) or []), str(e))
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -550,12 +732,15 @@ def get_garments():
                         "color": g.get("color"),
                         "category": g.get("category", "saree"),
                         "imageUrl": g.get("image_url"),
-                        "price": g.get("price", 3999)
+                        "price": g.get("price", 3999),
+                        "model3dUrl": g.get("model_3d_url"),
+                        "backImageUrl": g.get("back_image_url"),
+                        "frontCutoutUrl": g.get("front_cutout_url"),
+                        "backCutoutUrl": g.get("back_cutout_url")
                     })
         except Exception as e:
             logger.error(f"Error fetching from Supabase: {e}")
 
-    # Combine fallback, local persistent garments, and supabase garments
     # Newest first: supabase garments already come back ordered by created_at
     # desc; local/fallback lists are stored oldest-appended-last, so reverse
     # them to match instead of always trailing behind real catalogue entries.
@@ -592,6 +777,112 @@ def preprocess_garment_image(image_bytes):
     return image_bytes
 
 
+def _upload_image_bytes(file_bytes: bytes, filename: str, mime_type: str) -> str:
+    """
+    Uploads to Supabase Storage's 'garments' bucket if connected, falling back
+    to local disk otherwise. Extracted from add_garment, which previously
+    inlined this for the one required garment photo; now reused for the
+    optional back-view photo and the two auto-generated 3D-preview cutouts.
+    """
+    if _supabase_connected:
+        try:
+            storage_url = f"{SUPABASE_URL}/storage/v1/object/garments/{filename}"
+            storage_resp = requests.post(
+                storage_url,
+                headers=get_supabase_storage_headers(mime_type),
+                data=file_bytes,
+                timeout=15
+            )
+            if storage_resp.status_code == 200:
+                return f"{SUPABASE_URL}/storage/v1/object/public/garments/{filename}"
+            logger.warning(f"Supabase storage upload returned status {storage_resp.status_code} for {filename}. Using local save fallback.")
+        except Exception as e:
+            logger.error(f"Supabase storage upload exception for {filename}: {e}")
+
+    logger.info(f"Saving {filename} locally on the server.")
+    file_path = os.path.join(LOCAL_UPLOAD_FOLDER, filename)
+    with open(file_path, 'wb') as f:
+        f.write(file_bytes)
+    return f"{request.host_url}static/uploads/{filename}"
+
+
+def _pil_to_png_bytes(img) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _insert_garment_row(core_fields: dict, optional_fields: dict):
+    """
+    Inserts into Supabase, tolerating optional columns (model_3d_url,
+    back_image_url, front_cutout_url, back_cutout_url) that may not exist yet
+    if schema.sql's ALTER TABLE migration hasn't been run against this
+    project. front_cutout_url in particular is generated on *every* upload
+    going forward (not just ones opting into a feature), so unlike
+    model_3d_url this risk isn't confined to someone actively using something
+    new -- without this retry, EVERY garment upload would start failing the
+    moment this code deploys against an unmigrated database.
+
+    Tries the full payload first; on Postgres's "column does not exist"
+    error, retries with only the original core fields so the garment still
+    saves -- just without the new data persisted -- rather than failing.
+    Returns the inserted row dict, or None (caller falls back to local JSON).
+    """
+    db_url = f"{SUPABASE_URL}/rest/v1/garments"
+    db_headers = get_supabase_headers()
+    db_headers["Prefer"] = "return=representation"
+
+    def _try_insert(payload):
+        return requests.post(db_url, headers=db_headers, json=payload, timeout=10)
+
+    try:
+        resp = _try_insert({**core_fields, **optional_fields})
+        if resp.status_code in (200, 201):
+            rows = resp.json()
+            return rows[0] if rows else None
+
+        # PostgREST reports a missing column as PGRST204 ("column not in
+        # schema cache") at its own API layer -- 42703 is the raw Postgres
+        # code and, verified against this exact endpoint, does NOT appear in
+        # the response PostgREST actually returns here. Checking for 42703
+        # alone meant this retry never fired: every upload silently fell
+        # through to local JSON-file storage (still functional, but a much
+        # weaker persistence story than the real table) until this was caught
+        # by an actual end-to-end test, not just a schema check.
+        if optional_fields and resp.status_code == 400 and (
+            "PGRST204" in resp.text or "42703" in resp.text
+        ):
+            logger.warning(
+                "Garment insert failed on a missing optional column (has the "
+                "schema.sql migration been run?). Retrying with core fields "
+                f"only. Details: {resp.text[:300]}"
+            )
+            resp = _try_insert(core_fields)
+            if resp.status_code in (200, 201):
+                rows = resp.json()
+                return rows[0] if rows else None
+
+        logger.error(f"Supabase database insert failed with status {resp.status_code}: {resp.text}")
+        return None
+    except Exception as e:
+        logger.error(f"Supabase DB insert exception: {e}")
+        return None
+
+
+def _decode_data_url(data_url: str):
+    """Splits a 'data:image/png;base64,...' string into (mime_type, raw_bytes)."""
+    if ',' in data_url:
+        header, b64 = data_url.split(',', 1)
+    else:
+        header, b64 = "data:image/jpeg;base64", data_url
+    mime_type = "image/jpeg"
+    if "png" in header:
+        mime_type = "image/png"
+    elif "webp" in header:
+        mime_type = "image/webp"
+    return mime_type, base64.b64decode(b64)
+
+
 @app.route('/garments', methods=['POST'])
 def add_garment():
     try:
@@ -610,7 +901,6 @@ def add_garment():
                 gender = 'Women'
             else:
                 gender = 'Men'
-        image_data = data.get('image')
         price = data.get('price')
         if price is not None:
             try:
@@ -620,103 +910,114 @@ def add_garment():
         else:
             price = 3999
 
-        if ',' in image_data:
-            header, image_data = image_data.split(',', 1)
-        else:
-            header = "data:image/jpeg;base64"
+        # Optional: a URL to an already-hosted .glb/.gltf for the 3D Mannequin
+        # viewer -- the admin pastes a link, not a file upload. None is a
+        # normal, expected value; most garments won't have one.
+        #
+        # Read as 'model3dUrl' (camelCase) because that's the exact JSON key
+        # the frontend sends -- uploadGarment() JSON.stringify()s its object
+        # with no case translation anywhere in this stack, so this must match
+        # api.ts's field name exactly, not the database column name (which
+        # stays snake_case, model_3d_url, matching image_url/gender).
+        model_3d_url = data.get('model3dUrl') or None
 
-        mime_type = "image/jpeg"
-        if "png" in header:
-            mime_type = "image/png"
-        elif "webp" in header:
-            mime_type = "image/webp"
+        # Optional: a second photo of the garment's back, for the same 3D
+        # Mannequin viewer when no model_3d_url exists. The existing 'image'
+        # field is the front view -- no change needed there, no extra step
+        # for garments that only ever get one photo.
+        back_image_data = data.get('backImage') or None
 
-        file_bytes = base64.b64decode(image_data)
-        
+        # A shared timestamp for every file this upload produces (front,
+        # front cutout, back, back cutout), so they're grouped together
+        # rather than each capturing time.time() microseconds apart.
+        timestamp = int(time.time())
+
+        # --- Front photo: unchanged existing behaviour ---
+        mime_type, file_bytes = _decode_data_url(data.get('image'))
         # Automatically isolate the garment from the model (face, skin, background)
         file_bytes = preprocess_garment_image(file_bytes)
-        
         file_ext = mime_type.split('/')[-1]
-        filename = f"garment_{int(time.time())}.{file_ext}"
-        img_url = None
-        saved_locally = False
-        local_url = f"{request.host_url}static/uploads/{filename}"
+        img_url = _upload_image_bytes(file_bytes, f"garment_{timestamp}.{file_ext}", mime_type)
 
-        # 1. Try Supabase Storage Upload if connected
-        if _supabase_connected:
+        # --- Front cutout: NEW, auto-generated for every upload so the 3D
+        # Mannequin viewer has something to show even when the admin never
+        # touches the (also new) back-photo field. Not fatal if it fails --
+        # the garment itself must still save.
+        front_cutout_url = None
+        try:
+            front_cutout_img = isolate_garment_image(Image.open(io.BytesIO(file_bytes)))
+            front_cutout_url = _upload_image_bytes(
+                _pil_to_png_bytes(front_cutout_img), f"garment_{timestamp}_front_cutout.png", "image/png"
+            )
+        except Exception as e:
+            logger.warning(f"Could not generate front cutout for 3D preview: {e}")
+
+        # --- Back photo + cutout: NEW, fully optional ---
+        back_image_url = None
+        back_cutout_url = None
+        if back_image_data:
             try:
-                storage_url = f"{SUPABASE_URL}/storage/v1/object/garments/{filename}"
-                storage_resp = requests.post(
-                    storage_url,
-                    headers=get_supabase_storage_headers(mime_type),
-                    data=file_bytes,
-                    timeout=15
+                back_mime, back_bytes = _decode_data_url(back_image_data)
+                back_ext = back_mime.split('/')[-1]
+                back_image_url = _upload_image_bytes(back_bytes, f"garment_{timestamp}_back.{back_ext}", back_mime)
+
+                back_cutout_img = isolate_garment_image(Image.open(io.BytesIO(back_bytes)))
+                back_cutout_url = _upload_image_bytes(
+                    _pil_to_png_bytes(back_cutout_img), f"garment_{timestamp}_back_cutout.png", "image/png"
                 )
-                if storage_resp.status_code == 200:
-                    img_url = f"{SUPABASE_URL}/storage/v1/object/public/garments/{filename}"
-                else:
-                    logger.warning(f"Supabase storage upload returned status {storage_resp.status_code}. Using local save fallback.")
             except Exception as e:
-                logger.error(f"Supabase storage upload exception: {e}")
+                logger.warning(f"Could not process back-view photo (garment still saves without it): {e}")
 
-        # 2. If storage upload failed or was skipped, save file locally
-        if not img_url:
-            logger.info("Saving garment image locally on the server.")
-            file_path = os.path.join(LOCAL_UPLOAD_FOLDER, filename)
-            with open(file_path, 'wb') as f:
-                f.write(file_bytes)
-            img_url = local_url
-            saved_locally = True
-
-        # 3. Try to insert into Supabase database if connected
-        if _supabase_connected:
-            try:
-                db_url = f"{SUPABASE_URL}/rest/v1/garments"
-                payload = {
-                    "name": name,
-                    "color": color,
-                    "category": category,
-                    "gender": gender,
-                    "image_url": img_url,
-                    "price": price
-                }
-                db_headers = get_supabase_headers()
-                db_headers["Prefer"] = "return=representation"
-                db_resp = requests.post(db_url, headers=db_headers, json=payload, timeout=10)
-                
-                if db_resp.status_code in (200, 201):
-                    inserted_rows = db_resp.json()
-                    if inserted_rows:
-                        new_row = inserted_rows[0]
-                        new_garment = {
-                            "id": str(new_row.get("id")),
-                            "name": new_row.get("name"),
-                            "color": new_row.get("color"),
-                            "category": new_row.get("category", "saree"),
-                            "imageUrl": new_row.get("image_url"),
-                            "price": new_row.get("price", 3999)
-                        }
-                        return jsonify({'success': True, 'garment': new_garment}), 201
-                else:
-                    logger.error(f"Supabase database insert failed with status {db_resp.status_code}: {db_resp.text}")
-            except Exception as e:
-                logger.error(f"Supabase DB insert exception: {e}")
-
-        # 4. Local DB Fallback (if Supabase is not connected or database insert failed)
-        if not saved_locally:
-            file_path = os.path.join(LOCAL_UPLOAD_FOLDER, filename)
-            with open(file_path, 'wb') as f:
-                f.write(file_bytes)
-        
-        new_garment = {
-            "id": f"local-garment-{int(time.time())}",
+        core_fields = {
             "name": name,
             "color": color,
             "category": category,
-            "imageUrl": local_url,
-            "price": price
+            "gender": gender,
+            "image_url": img_url,
+            "price": price,
         }
-        
+        optional_fields = {}
+        if model_3d_url:
+            optional_fields["model_3d_url"] = model_3d_url
+        if back_image_url:
+            optional_fields["back_image_url"] = back_image_url
+        if front_cutout_url:
+            optional_fields["front_cutout_url"] = front_cutout_url
+        if back_cutout_url:
+            optional_fields["back_cutout_url"] = back_cutout_url
+
+        if _supabase_connected:
+            new_row = _insert_garment_row(core_fields, optional_fields)
+            if new_row:
+                new_garment = {
+                    "id": str(new_row.get("id")),
+                    "name": new_row.get("name"),
+                    "color": new_row.get("color"),
+                    "category": new_row.get("category", "saree"),
+                    "imageUrl": new_row.get("image_url"),
+                    "price": new_row.get("price", 3999),
+                    "model3dUrl": new_row.get("model_3d_url"),
+                    "backImageUrl": new_row.get("back_image_url"),
+                    "frontCutoutUrl": new_row.get("front_cutout_url"),
+                    "backCutoutUrl": new_row.get("back_cutout_url"),
+                }
+                return jsonify({'success': True, 'garment': new_garment}), 201
+            # Falls through to the local fallback below on any insert failure.
+
+        # Local DB Fallback (Supabase not connected, or the insert failed)
+        new_garment = {
+            "id": f"local-garment-{timestamp}",
+            "name": name,
+            "color": color,
+            "category": category,
+            "imageUrl": img_url,
+            "price": price,
+            "model3dUrl": model_3d_url,
+            "backImageUrl": back_image_url,
+            "frontCutoutUrl": front_cutout_url,
+            "backCutoutUrl": back_cutout_url,
+        }
+
         if save_local_garment(new_garment):
             return jsonify({'success': True, 'garment': new_garment}), 201
         else:
@@ -1234,7 +1535,8 @@ def get_feedback_analytics():
             },
             'recent': recent_feedbacks,
             'category_distribution': category_distribution,
-            'most_tried_products': most_tried_products
+            'most_tried_products': most_tried_products,
+            'tryon_reliability': _get_tryon_reliability_summary()
         }), 200
     except Exception as e:
         logger.error(f"Error fetching feedback analytics: {e}")

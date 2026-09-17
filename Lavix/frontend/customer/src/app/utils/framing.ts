@@ -21,8 +21,17 @@ export interface FramingHint {
   ready: boolean;
 }
 
-/** Above this fraction of frame height, the body cannot be in shot. */
-const FACE_TOO_CLOSE = 0.30;
+/**
+ * Above this fraction of frame height, the body cannot be in shot. Two
+ * thresholds because how much of the body actually needs to be visible
+ * depends on what's being tried on: a full-length garment (saree, dress,
+ * lehenga, jeans) needs the customer standing back so the whole thing is in
+ * frame, but a shirt/t-shirt/jacket only needs waist-up -- requiring the
+ * same distance as a saree just makes those customers back away for no
+ * reason, when standing closer would already frame it correctly.
+ */
+const FACE_TOO_CLOSE_FULL_BODY = 0.30;
+const FACE_TOO_CLOSE_UPPER_BODY = 0.48;
 /** Below this, the person is far enough away that detection gets unreliable. */
 const FACE_TOO_FAR = 0.045;
 /** Horizontal band, as a fraction of width, that counts as centred. */
@@ -31,11 +40,16 @@ const CENTRE_MAX = 0.70;
 
 export interface Point { x: number; y: number }
 
+export type BodyCoverage = "upper" | "full";
+
 /**
  * @param landmarks normalised (0..1) face landmarks from MediaPipe, or null/empty
  *                  when no face is detected.
+ * @param bodyCoverage "upper" for garments only worn above the waist (shirts,
+ *                  t-shirts, jackets, tops), "full" (default) for anything
+ *                  where the render needs more of the body visible.
  */
-export function evaluateFraming(landmarks: Point[] | null | undefined): FramingHint {
+export function evaluateFraming(landmarks: Point[] | null | undefined, bodyCoverage: BodyCoverage = "full"): FramingHint {
   if (!landmarks || landmarks.length === 0) {
     return {
       status: "no-face",
@@ -54,13 +68,16 @@ export function evaluateFraming(landmarks: Point[] | null | undefined): FramingH
 
   const faceHeight = maxY - minY;
   const centreX = (minX + maxX) / 2;
+  const tooCloseThreshold = bodyCoverage === "upper" ? FACE_TOO_CLOSE_UPPER_BODY : FACE_TOO_CLOSE_FULL_BODY;
 
   // Distance dominates: being too close is what actually breaks the render, so
   // it is reported before any centring nitpick.
-  if (faceHeight > FACE_TOO_CLOSE) {
+  if (faceHeight > tooCloseThreshold) {
     return {
       status: "too-close",
-      message: "Step back so your full body is in the frame",
+      message: bodyCoverage === "upper"
+        ? "Step back a little so your upper body is in the frame"
+        : "Step back so your full body is in the frame",
       ready: false,
     };
   }
@@ -85,7 +102,7 @@ export function evaluateFraming(landmarks: Point[] | null | undefined): FramingH
 
   return {
     status: "ready",
-    message: "Perfect — you're all set",
+    message: "Perfect — hold still, capturing...",
     ready: true,
   };
 }
