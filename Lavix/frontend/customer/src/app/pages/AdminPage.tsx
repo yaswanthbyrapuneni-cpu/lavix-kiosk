@@ -973,6 +973,65 @@ function UploadGarmentsView() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterCategory, setFilterCategory] = useState("All");
 
+  // Bulk upload: multiple files selected at once, each auto-categorized from
+  // its filename (same detectGarmentCategory/detectGarmentGender used for
+  // the single-item name field), submitted as a batch. Color/price aren't
+  // set per-item -- same "Custom"/3999 defaults the single-upload path uses.
+  const [bulkFiles, setBulkFiles] = useState<{ file: File; name: string; category: string; gender: string; preview: string }[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
+
+  const formatFileNameToTitle = (filename: string) => {
+    return filename
+      .replace(/\.[^/.]+$/, "") // remove extension
+      .replace(/[-_]/g, " ") // replace dashes and underscores with spaces
+      .replace(/\b\w/g, (l) => l.toUpperCase()); // title case
+  };
+
+  // Live camera capture as an alternative to picking a file, for the front
+  // garment photo only -- the separate back-view field below still only
+  // takes a file.
+  const [showWebcam, setShowWebcam] = useState(false);
+  const videoRef = React.useRef<HTMLVideoElement>(null);
+  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+
+  const startWebcam = async () => {
+    setShowWebcam(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+    } catch (err) {
+      console.error("Error accessing webcam: ", err);
+      setMessage({ text: "Could not access camera. Please allow camera permissions.", type: "error" });
+      setShowWebcam(false);
+    }
+  };
+
+  const stopWebcam = () => {
+    if (videoRef.current?.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach((track) => track.stop());
+    }
+    setShowWebcam(false);
+  };
+
+  const capturePhoto = () => {
+    if (videoRef.current && canvasRef.current) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL("image/png");
+        setImagePreview(dataUrl);
+        stopWebcam();
+      }
+    }
+  };
+
   const fetchCatalog = async () => {
     setLoadingList(true);
     // force: the admin is managing this catalogue and must never act on a
@@ -994,13 +1053,43 @@ function UploadGarmentsView() {
     setCategory(autoCat);
   };
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
+  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    if (files.length === 1) {
+      const file = files[0];
       const reader = new FileReader();
       reader.onloadend = () => setImagePreview(reader.result as string);
       reader.readAsDataURL(file);
+      setBulkFiles([]);
+      return;
     }
+
+    // Bulk mode: several files selected together
+    const processedFiles = await Promise.all(
+      files.map(
+        (file) =>
+          new Promise<{ file: File; name: string; category: string; gender: string; preview: string }>((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const title = formatFileNameToTitle(file.name);
+              const autoCat = detectGarmentCategory(title);
+              const autoGender = detectGarmentGender(title);
+              resolve({
+                file,
+                name: title,
+                category: autoCat,
+                gender: autoGender,
+                preview: reader.result as string
+              });
+            };
+            reader.readAsDataURL(file);
+          })
+      )
+    );
+    setBulkFiles(processedFiles);
+    setImagePreview(processedFiles[0].preview); // fallback only, bulk mode doesn't render this
   };
 
   const handleDelete = async (id: string | number, garmentName: string) => {
@@ -1017,6 +1106,36 @@ function UploadGarmentsView() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (bulkFiles.length > 1) {
+      setUploading(true);
+      setMessage(null);
+      setUploadProgress({ current: 0, total: bulkFiles.length });
+
+      let successCount = 0;
+      for (let i = 0; i < bulkFiles.length; i++) {
+        const item = bulkFiles[i];
+        setUploadProgress({ current: i + 1, total: bulkFiles.length });
+        const res = await uploadGarment({
+          name: item.name,
+          color: "Custom",
+          category: item.category,
+          gender: item.gender,
+          image: item.preview,
+          price: 3999
+        });
+        if (res.success) successCount++;
+      }
+
+      setMessage({ text: `Successfully published ${successCount} out of ${bulkFiles.length} garments!`, type: "success" });
+      setBulkFiles([]);
+      setImagePreview(null);
+      setUploadProgress(null);
+      setUploading(false);
+      fetchCatalog();
+      return;
+    }
+
     if (!imagePreview) {
       setMessage({ text: "Please select a garment photo", type: "error" });
       return;
@@ -1070,110 +1189,170 @@ function UploadGarmentsView() {
           )}
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-5">
-            <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-gray-700">
-                Garment Name (Auto Categorization Active) <span className="font-normal text-gray-400">(optional)</span>
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. Royal Silk Banarasi Saree, Formal Oxford Shirt, Slim Denim Jeans — leave blank for 'Untitled Garment'"
-                value={name}
-                onChange={(e) => handleNameChange(e.target.value)}
-                className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
-              />
-            </div>
-
-            {/* Gender Toggle */}
-            <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-gray-700">Gender Collection</label>
-              <div className="flex rounded-xl border border-gray-300 overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => { setGender("Men"); setCategory(MEN_CATEGORIES[0]); }}
-                  className={`flex-1 py-2.5 text-sm font-bold transition-colors ${gender === "Men"
-                      ? "bg-gray-900 text-white"
-                      : "bg-white text-gray-600 hover:bg-gray-100"
-                    }`}
-                >
-                  👔 Men
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setGender("Women"); setCategory(WOMEN_CATEGORIES[0]); }}
-                  className={`flex-1 py-2.5 text-sm font-bold transition-colors ${gender === "Women"
-                      ? "bg-pink-600 text-white"
-                      : "bg-white text-gray-600 hover:bg-gray-100"
-                    }`}
-                >
-                  👗 Women
-                </button>
-              </div>
-            </div>
-
-            {/* Category, Color & Price */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="flex flex-col gap-2">
-                <label className="text-sm font-semibold text-gray-700">Category</label>
-                <select
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
-                >
-                  {(gender === "Women" ? WOMEN_CATEGORIES : MEN_CATEGORIES).map((cat) => (
-                    <option key={cat} value={cat}>{cat}</option>
+            {bulkFiles.length > 1 ? (
+              <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-5 flex flex-col gap-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-indigo-900 flex items-center gap-2">
+                    <Upload className="w-5 h-5" /> Bulk Upload Mode
+                  </h3>
+                  <span className="text-xs font-semibold bg-indigo-200 text-indigo-800 px-2.5 py-1 rounded-full">
+                    {bulkFiles.length} files selected
+                  </span>
+                </div>
+                <p className="text-xs text-indigo-700 font-medium">Names, genders, and categories have been auto-inferred from filenames. Prices default to ₹3999 and color to "Custom".</p>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 max-h-[300px] overflow-y-auto pr-2">
+                  {bulkFiles.map((f, i) => (
+                    <div key={i} className="bg-white p-2 rounded-xl border border-indigo-100 shadow-sm flex flex-col gap-2">
+                      <div className="h-24 w-full bg-gray-50 rounded-lg overflow-hidden border border-gray-100">
+                        <img src={f.preview} alt={f.name} className="w-full h-full object-cover" />
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-[10px] font-bold text-gray-800 truncate" title={f.name}>{f.name}</span>
+                        <span className="text-[9px] font-medium text-gray-500 truncate">{f.gender} • {f.category}</span>
+                      </div>
+                    </div>
                   ))}
-                </select>
+                </div>
+                <button type="button" onClick={() => setBulkFiles([])} className="self-start text-xs font-semibold text-indigo-600 hover:text-indigo-800 transition-colors">
+                  Cancel Bulk Upload
+                </button>
               </div>
+            ) : (
+              <>
+                <div className="flex flex-col gap-2">
+                  <label className="text-sm font-semibold text-gray-700">
+                    Garment Name (Auto Categorization Active) <span className="font-normal text-gray-400">(optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Royal Silk Banarasi Saree, Formal Oxford Shirt, Slim Denim Jeans — leave blank for 'Untitled Garment'"
+                    value={name}
+                    onChange={(e) => handleNameChange(e.target.value)}
+                    className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
+                  />
+                </div>
 
-              <div className="flex flex-col gap-2">
-                <label className="text-sm font-semibold text-gray-700">
-                  Color <span className="font-normal text-gray-400">(optional)</span>
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Red & Gold, Navy Blue — leave blank for 'Custom'"
-                  value={color}
-                  onChange={(e) => setColor(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
-                />
-              </div>
+                {/* Gender Toggle */}
+                <div className="flex flex-col gap-2">
+                  <label className="text-sm font-semibold text-gray-700">Gender Collection</label>
+                  <div className="flex rounded-xl border border-gray-300 overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => { setGender("Men"); setCategory(MEN_CATEGORIES[0]); }}
+                      className={`flex-1 py-2.5 text-sm font-bold transition-colors ${gender === "Men"
+                          ? "bg-gray-900 text-white"
+                          : "bg-white text-gray-600 hover:bg-gray-100"
+                        }`}
+                    >
+                      👔 Men
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setGender("Women"); setCategory(WOMEN_CATEGORIES[0]); }}
+                      className={`flex-1 py-2.5 text-sm font-bold transition-colors ${gender === "Women"
+                          ? "bg-pink-600 text-white"
+                          : "bg-white text-gray-600 hover:bg-gray-100"
+                        }`}
+                    >
+                      👗 Women
+                    </button>
+                  </div>
+                </div>
 
-              <div className="flex flex-col gap-2">
-                <label className="text-sm font-semibold text-gray-700">
-                  Price (Rs.) <span className="font-normal text-gray-400">(optional)</span>
-                </label>
-                <input
-                  type="number"
-                  placeholder="e.g. 3999 — leave blank for 3999"
-                  value={price}
-                  onChange={(e) => setPrice(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
-                />
-              </div>
-            </div>
+                {/* Category, Color & Price */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="flex flex-col gap-2">
+                    <label className="text-sm font-semibold text-gray-700">Category</label>
+                    <select
+                      value={category}
+                      onChange={(e) => setCategory(e.target.value)}
+                      className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
+                    >
+                      {(gender === "Women" ? WOMEN_CATEGORIES : MEN_CATEGORIES).map((cat) => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <label className="text-sm font-semibold text-gray-700">
+                      Color <span className="font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Red & Gold, Navy Blue — leave blank for 'Custom'"
+                      value={color}
+                      onChange={(e) => setColor(e.target.value)}
+                      className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
+                    />
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    <label className="text-sm font-semibold text-gray-700">
+                      Price (Rs.) <span className="font-normal text-gray-400">(optional)</span>
+                    </label>
+                    <input
+                      type="number"
+                      placeholder="e.g. 3999 — leave blank for 3999"
+                      value={price}
+                      onChange={(e) => setPrice(e.target.value)}
+                      className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
+                    />
+                  </div>
+                </div>
+              </>
+            )}
 
             <div className="flex flex-col gap-2">
               <label className="text-sm font-semibold text-gray-700">Garment Image</label>
-              <div className="border-2 border-dashed border-gray-300 rounded-2xl p-6 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer relative">
+              {showWebcam ? (
+                <div className="border-2 border-dashed border-gray-300 rounded-2xl p-4 flex flex-col items-center justify-center bg-gray-900 relative overflow-hidden">
+                  <video ref={videoRef} className="w-full max-h-[300px] object-cover rounded-xl bg-black" playsInline autoPlay muted />
+                  <canvas ref={canvasRef} className="hidden" />
+                  <div className="absolute bottom-6 flex gap-4">
+                    <button type="button" onClick={stopWebcam} className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-full text-sm font-semibold shadow-lg transition-colors">
+                      Cancel
+                    </button>
+                    <button type="button" onClick={capturePhoto} className="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-sm font-bold shadow-lg transition-colors flex items-center gap-2">
+                      <Camera className="w-4 h-4" /> Capture
+                    </button>
+                  </div>
+                </div>
+              ) : (
+              <div className="border-2 border-dashed border-gray-300 rounded-2xl p-6 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors relative">
                 {imagePreview ? (
                   <div className="flex flex-col items-center gap-3">
                     <img src={imagePreview} alt="Preview" className="h-44 object-contain rounded-lg border shadow-sm bg-white" />
-                    <span className="text-xs text-gray-500 font-medium">Click to replace photo</span>
+                    <div className="flex gap-3 mt-2">
+                      <label className="text-xs font-semibold bg-white border border-gray-300 text-gray-700 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-gray-50 shadow-sm flex items-center gap-1.5 transition-colors">
+                        <Upload className="w-3.5 h-3.5" /> Upload File(s)
+                        <input type="file" accept="image/*" multiple onChange={handleImageChange} className="hidden" />
+                      </label>
+                      <button type="button" onClick={startWebcam} className="text-xs font-semibold bg-white border border-gray-300 text-gray-700 px-3 py-1.5 rounded-lg cursor-pointer hover:bg-gray-50 flex items-center gap-1.5 shadow-sm transition-colors">
+                        <Camera className="w-3.5 h-3.5" /> Take Photo
+                      </button>
+                    </div>
                   </div>
                 ) : (
-                  <div className="flex flex-col items-center gap-2">
-                    <Upload className="w-9 h-9 text-gray-400" />
-                    <span className="text-sm font-semibold text-gray-700">Select Garment Photo</span>
-                    <span className="text-xs text-gray-400">High Resolution JPG, PNG, WebP</span>
+                  <div className="flex flex-col items-center gap-4 w-full">
+                    <div className="flex flex-col items-center gap-2 pointer-events-none">
+                      <Upload className="w-9 h-9 text-gray-400" />
+                      <span className="text-sm font-semibold text-gray-700">Select or Take Garment Photo</span>
+                      <span className="text-xs text-gray-400">High Resolution JPG, PNG, WebP</span>
+                    </div>
+                    <div className="flex gap-3 z-10 relative">
+                      <label className="text-sm font-semibold bg-white border border-gray-300 text-gray-700 px-5 py-2.5 rounded-xl cursor-pointer hover:bg-gray-50 shadow-sm flex items-center gap-2 transition-colors">
+                        <Upload className="w-4 h-4" /> Upload File(s)
+                        <input type="file" accept="image/*" multiple onChange={handleImageChange} className="hidden" />
+                      </label>
+                      <button type="button" onClick={startWebcam} className="text-sm font-semibold bg-indigo-50 border border-indigo-200 text-indigo-700 px-5 py-2.5 rounded-xl cursor-pointer hover:bg-indigo-100 shadow-sm flex items-center gap-2 transition-colors">
+                        <Camera className="w-4 h-4" /> Take Photo
+                      </button>
+                    </div>
                   </div>
                 )}
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleImageChange}
-                  className="absolute inset-0 opacity-0 cursor-pointer"
-                />
               </div>
+              )}
             </div>
 
             <button
@@ -1184,12 +1363,16 @@ function UploadGarmentsView() {
               {uploading ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  <span>Categorizing & Uploading...</span>
+                  <span>
+                    {uploadProgress ? `Uploading ${uploadProgress.current} of ${uploadProgress.total}...` : "Categorizing & Uploading..."}
+                  </span>
                 </>
               ) : (
                 <>
                   <Upload className="w-4 h-4" />
-                  <span>Publish Garment to Category</span>
+                  <span>
+                    {bulkFiles.length > 1 ? `Publish ${bulkFiles.length} Garments` : "Publish Garment to Category"}
+                  </span>
                 </>
               )}
             </button>
