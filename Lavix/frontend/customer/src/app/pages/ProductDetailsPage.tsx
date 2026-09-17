@@ -125,6 +125,24 @@ export function ProductDetailsPage({
   const [isDegradedResult, setIsDegradedResult] = useState(false);
   const [cartAdded, setCartAdded] = useState(false);
 
+  const LOADING_MESSAGES = [
+    "Aligning Body & Rendering Garment...",
+    "Analyzing Fabric Physics...",
+    "Stitching Seamless Edges...",
+    "Applying Lighting & Shadows...",
+    "Generating Virtual Try-On..."
+  ];
+  const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
+
+  useEffect(() => {
+    if (isTryOnLoading) {
+      const interval = setInterval(() => {
+        setLoadingMessageIndex((prev) => (prev + 1) % LOADING_MESSAGES.length);
+      }, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [isTryOnLoading]);
+
   // Virtual Try-On Panel State
   const [zoomLevel, setZoomLevel] = useState<number>(100);
   const [rotationAngle, setRotationAngle] = useState<number>(0);
@@ -616,7 +634,7 @@ export function ProductDetailsPage({
                   <div className="absolute left-0 right-0 h-2 bg-indigo-500 shadow-[0_0_20px_6px_#6366f1] animate-[scan_2s_ease-in-out_infinite]" />
                 </div>
                 <p className="text-xl text-indigo-300 font-bold animate-pulse flex items-center gap-2 bg-black/80 px-8 py-4 rounded-full border border-indigo-500/40 backdrop-blur-md shadow-2xl">
-                  <Sparkles className="w-6 h-6 text-amber-300 animate-spin" /> Aligning Body & Rendering Garment...
+                  <Sparkles className="w-6 h-6 text-amber-300 animate-spin" /> {LOADING_MESSAGES[loadingMessageIndex]}
                 </p>
               </div>
             </div>
@@ -653,9 +671,13 @@ export function ProductDetailsPage({
                   <Webcam
                     audio={false}
                     ref={webcamRef}
-                    screenshotFormat="image/jpeg"
+                    screenshotFormat="image/png"
                     className="w-full h-full object-cover"
-                    videoConstraints={{ facingMode }}
+                    videoConstraints={{
+                      width: { ideal: 1920 },
+                      height: { ideal: 1080 },
+                      facingMode
+                    }}
                   />
 
                   {/* Live positioning guidance */}
