@@ -727,10 +727,58 @@ def add_garment():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _delete_storage_object(url: str):
+    """
+    Best-effort delete of a Supabase Storage object from its public URL.
+    No-ops for anything not hosted in Supabase Storage (e.g. the local-disk
+    fallback path from _upload_image_bytes) -- nothing to clean up there.
+    """
+    if not url or "/storage/v1/object/public/garments/" not in url:
+        return
+    try:
+        filename = url.split("/storage/v1/object/public/garments/", 1)[1]
+        del_url = f"{SUPABASE_URL}/storage/v1/object/garments/{filename}"
+        requests.delete(del_url, headers=get_supabase_headers(), timeout=10)
+    except Exception as e:
+        logger.warning(f"Failed to delete storage object for {url}: {e}")
+
+
 @app.route('/garments/<garment_id>', methods=['DELETE'])
 def delete_garment(garment_id):
     try:
         str_id = str(garment_id).strip()
+
+        # Supabase is the source of truth -- actually delete the row (and
+        # its uploaded photos) there instead of only hiding it locally.
+        # The local deleted-IDs file below doesn't survive a backend
+        # container rebuild, which is exactly what was letting "deleted"
+        # garments reappear after every redeploy: the row was never really
+        # gone, just filtered out by a list that kept getting wiped.
+        if _supabase_connected:
+            try:
+                get_url = (
+                    f"{SUPABASE_URL}/rest/v1/garments?id=eq.{str_id}"
+                    f"&select=image_url,back_image_url,front_cutout_url,back_cutout_url"
+                )
+                get_resp = requests.get(get_url, headers=get_supabase_headers(), timeout=10)
+                if get_resp.status_code == 200:
+                    rows = get_resp.json()
+                    if rows:
+                        row = rows[0]
+                        for key in ("image_url", "back_image_url", "front_cutout_url", "back_cutout_url"):
+                            _delete_storage_object(row.get(key))
+
+                del_url = f"{SUPABASE_URL}/rest/v1/garments?id=eq.{str_id}"
+                del_resp = requests.delete(del_url, headers=get_supabase_headers(), timeout=10)
+                if del_resp.status_code not in (200, 204):
+                    logger.warning(f"Supabase garment delete returned {del_resp.status_code}: {del_resp.text[:300]}")
+            except Exception as e:
+                logger.warning(f"Supabase garment delete failed: {e}")
+
+        # Kept as the fallback for garments that only ever existed locally
+        # (Supabase never connected/configured), and so the response to
+        # this same request already reflects the deletion immediately
+        # rather than waiting on the next full Supabase read.
         save_deleted_id(str_id)
 
         local_garments = load_local_garments()
