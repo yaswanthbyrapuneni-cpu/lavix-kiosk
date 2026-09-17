@@ -490,7 +490,7 @@ export function ProductDetailsPage({
                   onClick={handleOpenMirrorModal}
                   className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
                 >
-                  <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300 animate-spin" />
+                  <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300" />
                   <span>Virtual Try-On Mirror</span>
                 </button>
 
