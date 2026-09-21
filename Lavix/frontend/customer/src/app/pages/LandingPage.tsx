@@ -172,22 +172,6 @@ export default function LandingPage() {
         />
       </div>
 
-      {/* ── Current Slide Label ── */}
-      <div className="absolute top-8 right-8 z-[10]">
-        <div
-          className="flex items-center gap-3 px-4 py-2 rounded-full"
-          style={{
-            background: "rgba(255,255,255,0.08)",
-            backdropFilter: "blur(12px)",
-            border: "1px solid rgba(255,255,255,0.15)",
-          }}
-        >
-          <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-          <span className="text-white/80 text-sm font-medium" style={{ fontFamily: "'Inter',sans-serif" }}>
-            AI Showroom Edition
-          </span>
-        </div>
-      </div>
 
       {/* ── Main Content ── */}
       <div className="relative z-[10] flex flex-col items-center gap-6 text-center px-6 max-w-4xl">

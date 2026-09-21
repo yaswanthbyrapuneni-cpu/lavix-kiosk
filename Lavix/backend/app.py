@@ -520,7 +520,13 @@ def try_on():
                     # "adults only" mode and its safety filter intermittently
                     # blocks legitimate photos with a 400, silently demoting
                     # them to the flat local-compositor fallback.
-                    "parameters": {"sampleCount": 1, "personGeneration": "allow_all"}
+                    # A fixed seed keeps the garment structure the model guesses
+                    # at consistent across attempts for flat/textured fabrics --
+                    # safe to fix since the retry loop below only re-attempts on
+                    # hard failures (non-2xx, empty predictions), never because
+                    # a successful render looked wrong, so there's no case where
+                    # a fixed seed reproduces a bad result on retry.
+                    "parameters": {"sampleCount": 1, "personGeneration": "allow_all", "seed": 42}
                 }
 
                 # Up to two attempts within VERTEX_TIMEOUT's existing budget (see

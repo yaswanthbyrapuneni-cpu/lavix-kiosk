@@ -31,25 +31,6 @@ import { useTryOnActivity } from "../context/TryOnActivityContext";
 import { loadDetector, runDetection } from "../detectors/DetectorManager";
 import { evaluateFraming, FramingHint } from "../utils/framing";
 
-// three.js + @react-three/fiber + @react-three/drei are a large chunk with no
-// place in every product page's initial bundle — only fetched once a customer
-// actually clicks "3D Mannequin". Deliberately not importing anything from
-// components/ThreeDMannequin/* other than this dynamic import — even a single
-// static import from that folder into this eagerly-loaded page would pull the
-// whole 3D stack back into the main bundle and defeat the split entirely.
-const MannequinModal = lazy(() => import("../components/ThreeDMannequin"));
-
-/** Shown only while the lazy chunk above is still downloading — deliberately
- * has zero dependency on three/fiber/drei so it's safe to import eagerly. */
-function MannequinChunkLoading() {
-  return (
-    <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center gap-4">
-      <div className="w-14 h-14 rounded-full border-4 border-white/20 border-t-emerald-400 animate-spin" />
-      <p className="text-white text-base font-semibold tracking-wide">Loading 3D Preview…</p>
-    </div>
-  );
-}
-
 export interface ColorOption {
   name: string;
   hex: string;
@@ -194,10 +175,6 @@ export function ProductDetailsPage({
       return () => clearInterval(interval);
     }
   }, [isTryOnLoading]);
-
-  // Independent of the try-on state above — this is a separate feature with
-  // its own modal, not a mode of the try-on mirror.
-  const [isMannequinModalOpen, setIsMannequinModalOpen] = useState(false);
 
   // Virtual Try-On Panel State
   const [zoomLevel, setZoomLevel] = useState<number>(100);
@@ -551,29 +528,18 @@ export function ProductDetailsPage({
               </div>
 
               {/* Action Buttons */}
-              <div className="flex flex-col gap-3 sm:gap-[16px] mt-2 sm:mt-[16px]">
-                <div className="flex flex-col sm:flex-row gap-3 sm:gap-[16px]">
-                  <button
-                    onClick={handleOpenMirrorModal}
-                    className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
-                  >
-                    <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300" />
-                    <span>Virtual Try-On Mirror</span>
-                  </button>
-
-                  <button
-                    onClick={() => setIsMannequinModalOpen(true)}
-                    aria-label="3D Mannequin"
-                    className="flex-1 bg-violet-600 hover:bg-violet-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
-                  >
-                    <Box className="w-5 h-5 sm:w-6 sm:h-6 text-violet-200" />
-                    <span>3D Mannequin</span>
-                  </button>
-                </div>
+              <div className="flex flex-col sm:flex-row gap-3 sm:gap-[16px] mt-2 sm:mt-[16px]">
+                <button
+                  onClick={handleOpenMirrorModal}
+                  className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-lg active:scale-98 cursor-pointer"
+                >
+                  <Sparkles className="w-5 h-5 sm:w-6 sm:h-6 text-amber-300" />
+                  <span>Virtual Try-On Mirror</span>
+                </button>
 
                 <button
                   onClick={() => setCartAdded(true)}
-                  className={`font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-sm ${
+                  className={`flex-1 font-bold py-4 sm:py-[20px] px-4 sm:px-8 rounded-2xl text-base sm:text-[20px] flex items-center justify-center gap-3 transition-all shadow-sm ${
                     cartAdded ? "bg-emerald-600 text-white" : "bg-black hover:bg-gray-900 text-white"
                   }`}
                 >
@@ -817,20 +783,6 @@ export function ProductDetailsPage({
         selectedGarment={productName}
       />
         </div>
-      )}
-
-      {/* 3D MANNEQUIN VIEWER — independent of the try-on mirror above; its own
-          modal, own state, own lazy-loaded code chunk. */}
-      {isMannequinModalOpen && (
-        <Suspense fallback={<MannequinChunkLoading />}>
-          <MannequinModal
-            garmentName={productName}
-            model3dUrl={model3dUrl}
-            frontPhotoUrl={frontCutoutUrl}
-            backPhotoUrl={backCutoutUrl}
-            onClose={() => setIsMannequinModalOpen(false)}
-          />
-        </Suspense>
       )}
 
     </div>

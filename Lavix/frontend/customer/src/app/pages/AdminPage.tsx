@@ -1411,51 +1411,6 @@ function UploadGarmentsView() {
               )}
             </div>
 
-            <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-gray-700">
-                Back View Photo <span className="font-normal text-gray-400">(optional — improves the "3D Mannequin" preview)</span>
-              </label>
-              <div className="border-2 border-dashed border-gray-300 rounded-2xl p-6 flex flex-col items-center justify-center bg-gray-50 hover:bg-gray-100 transition-colors cursor-pointer relative">
-                {backImagePreview ? (
-                  <div className="flex flex-col items-center gap-3">
-                    <img src={backImagePreview} alt="Back view preview" className="h-44 object-contain rounded-lg border shadow-sm bg-white" />
-                    <span className="text-xs text-gray-500 font-medium">Click to replace photo</span>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-2">
-                    <Upload className="w-9 h-9 text-gray-400" />
-                    <span className="text-sm font-semibold text-gray-700">Select Back View Photo</span>
-                    <span className="text-xs text-gray-400">Same garment, photographed from behind</span>
-                  </div>
-                )}
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={handleBackImageChange}
-                  className="absolute inset-0 opacity-0 cursor-pointer"
-                />
-              </div>
-              <span className="text-xs text-gray-400">
-                Without this, "3D Mannequin" still works using just the front photo above — the back simply won't be shown while rotating.
-              </span>
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <label className="text-sm font-semibold text-gray-700">
-                3D Model URL <span className="font-normal text-gray-400">(optional — best-quality "3D Mannequin", if you have one)</span>
-              </label>
-              <input
-                type="url"
-                placeholder="https://.../garment.glb"
-                value={model3dUrl}
-                onChange={(e) => setModel3dUrl(e.target.value)}
-                className="w-full px-4 py-2.5 rounded-xl border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-medium"
-              />
-              <span className="text-xs text-gray-400">
-                Link to an already-hosted .glb/.gltf file. When set, this is used instead of the front/back photos above. Leave blank if none exists yet.
-              </span>
-            </div>
-
             <button
               type="submit"
               disabled={uploading}
