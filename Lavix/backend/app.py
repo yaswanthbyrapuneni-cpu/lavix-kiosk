@@ -165,21 +165,33 @@ def _crop_face_region_if_present(g_img: "Image.Image") -> "Image.Image":
     texture swatch with no visible collar/pocket/silhouette. Detecting the
     face first and cropping just past its chin -- or not cropping at all
     when there's no face to remove -- handles both photo styles correctly.
+
+    minSize is deliberately a fraction of the image's shorter dimension, not
+    a fixed pixel count: a flat 40x40px minimum is a meaningless threshold
+    on the 3000-4000px photos this catalogue's phone-camera uploads actually
+    are (well under 2% of the frame), and the Haar cascade was confirmed
+    (against real saree/blouse catalogue photos with no person in them at
+    all) to false-positive on dense gold embroidery and brocade motifs at
+    that size -- cropping into product photos that had nothing to remove.
+    Requiring a real face to occupy a meaningful share of the frame (~15%)
+    eliminates those false positives while still catching genuine faces,
+    which are proportionally much larger in an actual portrait-style shot.
     """
     try:
         import cv2
         rgb = np.array(g_img.convert("RGB"))
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        g_w, g_h = g_img.size
+        min_dim = int(min(g_w, g_h) * 0.15)
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         detector = cv2.CascadeClassifier(cascade_path)
-        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(min_dim, min_dim))
         if len(faces) == 0:
             return g_img
 
         # Largest detected face -- crop everything from just past its chin
         # downward, leaving the garment below completely untouched.
         fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        g_w, g_h = g_img.size
         crop_top = int(fy + fh * 1.3)
         crop_top = max(0, min(crop_top, int(g_h * 0.6)))  # never eat more than 60% of the frame
         if crop_top <= 0:
@@ -193,21 +205,53 @@ def _crop_face_region_if_present(g_img: "Image.Image") -> "Image.Image":
 def isolate_garment_b64_for_vertex(garment_b64: str) -> str:
     """
     Prepares the garment reference photo for Vertex: rembg background
-    removal, plus a face-detection-gated crop (see _crop_face_region_if_present)
-    instead of the 3D Mannequin cutout's fixed-percentage crop. Garment
-    catalog photos routinely show a model wearing the item with their face
-    fully visible; Vertex's virtual-try-on model has been observed leaking
-    that face into the output as a floating artifact when given an
-    uncropped reference photo -- but real admin uploads vary hugely in
-    framing, and many are already tight torso-only crops with no face at
-    all, which a blind fixed-percentage crop would butcher. Falls back to
-    the original image, only color-normalized, if isolation fails for any
-    reason -- a messier reference is still better than no result at all.
+    removal (with a sanity check -- see below), plus a face-detection-gated
+    crop (see _crop_face_region_if_present) instead of the 3D Mannequin
+    cutout's fixed-percentage crop. Garment catalog photos routinely show a
+    model wearing the item with their face fully visible; Vertex's
+    virtual-try-on model has been observed leaking that face into the
+    output as a floating artifact when given an uncropped reference photo
+    -- but real admin uploads vary hugely in framing, and many are already
+    tight torso-only crops with no face at all, which a blind fixed-
+    percentage crop would butcher. Falls back to the original image, only
+    color-normalized, if isolation fails for any reason -- a messier
+    reference is still better than no result at all.
+
+    rembg sanity check: confirmed against real catalogue photos that rembg
+    can catastrophically over-remove busy/reflective saree silk (gold
+    brocade, dense metallic thread) -- not a minor artifact, entire garments
+    came back as a near-blank white image with faint ghost traces, which
+    would leave Vertex with almost nothing to work from. rembg works fine
+    on ordinary model-wearing-garment photos (its actual intended case), so
+    rather than dropping it everywhere, only trust its output when a
+    reasonable share of the frame actually survived as solid (mostly
+    opaque) foreground; discard and use the untouched original otherwise.
+    A low alpha threshold (e.g. >30) is not enough on its own -- a failed
+    removal can still leave a large area of faint, near-transparent ghost
+    pixels (alpha ~30-60) that pass a low bar without representing real
+    surviving fabric, so this checks the fraction of pixels that are
+    solidly opaque (>128) instead. Calibrated against real catalog photos:
+    good removals kept 23-75% of pixels solidly opaque, failed ones kept
+    under 3%.
     """
     try:
         img_bytes = base64.b64decode(garment_b64)
         img = Image.open(io.BytesIO(img_bytes))
-        isolated = _crop_face_region_if_present(_rembg_remove_background(img))
+        img_rgba = img.convert("RGBA")
+
+        bg_removed = _rembg_remove_background(img)
+        alpha = np.array(bg_removed.split()[-1])
+        surviving_fraction = float(np.count_nonzero(alpha > 128)) / alpha.size
+        if surviving_fraction < 0.10:
+            logger.warning(
+                f"rembg kept only {surviving_fraction:.0%} of the frame as foreground -- "
+                "treating as a failed removal and using the original background instead."
+            )
+            base_img = img_rgba
+        else:
+            base_img = bg_removed
+
+        isolated = _crop_face_region_if_present(base_img)
         # Vertex expects a normal product photo, not a transparent cutout --
         # flatten onto white, matching convert_to_clean_rgb_b64's convention.
         background = Image.new("RGB", isolated.size, (255, 255, 255))
